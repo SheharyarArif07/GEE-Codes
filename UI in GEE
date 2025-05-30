@@ -1,0 +1,230 @@
+Use the following code to build user interface in GEE to download sentinel images.
+// ====================
+// ✅ UI PANEL SETUP
+// ====================
+var panel = ui.Panel({style: {width: '400px'}});
+
+panel.add(ui.Label({
+  value: 'Flood Visualization App - Sentinel-2',
+  style: {fontSize: '20px', fontWeight: 'bold'}
+}));
+
+Map.centerObject(table, 9);
+
+// ====================
+// ✅ Date Pickers
+// ====================
+var preStart = ui.Textbox({placeholder: 'Pre-Flood Start (yyyy-mm-dd)', value: '2022-06-20'});
+var preEnd = ui.Textbox({placeholder: 'Pre-Flood End (yyyy-mm-dd)', value: '2022-08-08'});
+var postStart = ui.Textbox({placeholder: 'Post-Flood Start (yyyy-mm-dd)', value: '2022-08-11'});
+var postEnd = ui.Textbox({placeholder: 'Post-Flood End (yyyy-mm-dd)', value: '2022-10-30'});
+
+panel.add(ui.Label('Select Pre-Flood Dates'));
+panel.add(preStart);
+panel.add(preEnd);
+
+panel.add(ui.Label('Select Post-Flood Dates'));
+panel.add(postStart);
+panel.add(postEnd);
+
+// ====================
+// ✅ Run Button
+// ====================
+var runButton = ui.Button({
+  label: 'Run Visualization',
+  style: {stretch: 'horizontal'},
+  onClick: function () {
+    Map.clear();
+    var beforeStart = preStart.getValue();
+    var beforeEnd = preEnd.getValue();
+    var afterStart = postStart.getValue();
+    var afterEnd = postEnd.getValue();
+    runFloodVisualization(beforeStart, beforeEnd, afterStart, afterEnd);
+  }
+});
+
+panel.add(runButton);
+ui.root.insert(0, panel);
+
+// ====================
+// ✅ Sentinel-2 Masking
+// ====================
+function maskS2sr(image) {
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var qa = image.select('QA60');
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).copyProperties(image, ['system:time_start']);
+}
+
+// ====================
+// ✅ NDWI Function
+// ====================
+function getNDWI(image) {
+  return image.normalizedDifference(['B3', 'B11']).rename('NDWI');
+}
+
+// ====================
+// ✅ Main Visualization Function
+// ====================
+function runFloodVisualization(beforeStart, beforeEnd, afterStart, afterEnd) {
+  var visParams = {
+    bands: ['B4', 'B3', 'B2'],
+    min: 0,
+    max: 3000,
+    gamma: 1.3
+  };
+
+  // ====================
+  // ✅ Pre-Flood
+  // ====================
+  var preFlood = ee.ImageCollection("COPERNICUS/S2")
+    .filterDate(beforeStart, beforeEnd)
+    .filterBounds(table)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+    .map(maskS2sr);
+
+  var preFloodCount = preFlood.size();
+  print('Pre-flood images count:', preFloodCount);
+
+  var preFloodMedian = ee.Image(
+    ee.Algorithms.If(
+      preFloodCount.gt(0),
+      preFlood.median().clip(table),
+      ee.Image().select()
+    )
+  );
+
+  var preNDWI = ee.Image(
+    ee.Algorithms.If(
+      preFloodCount.gt(0),
+      getNDWI(preFloodMedian),
+      ee.Image().select()
+    )
+  );
+
+  var preWaterMask = preNDWI.gt(0);
+
+  // ====================
+  // ✅ Post-Flood
+  // ====================
+  var postFlood = ee.ImageCollection("COPERNICUS/S2")
+    .filterDate(afterStart, afterEnd)
+    .filterBounds(table)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+    .map(maskS2sr);
+
+  var postFloodCount = postFlood.size();
+  print('Post-flood images count:', postFloodCount);
+
+  var postFloodMedian = ee.Image(
+    ee.Algorithms.If(
+      postFloodCount.gt(0),
+      postFlood.median().clip(table),
+      ee.Image().select()
+    )
+  );
+
+  var postNDWI = ee.Image(
+    ee.Algorithms.If(
+      postFloodCount.gt(0),
+      getNDWI(postFloodMedian),
+      ee.Image().select()
+    )
+  );
+
+  var postWaterMask = postNDWI.gt(0);
+
+  // ====================
+  // ✅ Add Layers
+  // ====================
+  Map.addLayer(postFloodMedian, visParams, 'Post-Flood');
+  Map.addLayer(preFloodMedian, visParams, 'Pre-Flood');
+
+  Map.addLayer(preWaterMask.updateMask(preWaterMask), {
+    palette: ['cyan']
+  }, 'Pre-Flood Water Mask');
+
+  Map.addLayer(postWaterMask.updateMask(postWaterMask), {
+    palette: ['cyan']
+  }, 'Post-Flood Water Mask');
+
+  // ====================
+  // ✅ Area Calculation
+  // ====================
+  var pixelArea = ee.Image.pixelArea().divide(10000);
+  var preArea = preWaterMask.multiply(pixelArea).rename('waterArea');
+  var postArea = postWaterMask.multiply(pixelArea).rename('waterArea');
+
+  var preStats = preArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: table,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  var postStats = postArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: table,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  var preWaterHa = ee.Number(preStats.get('waterArea'));
+  var postWaterHa = ee.Number(postStats.get('waterArea'));
+
+  print('Pre-Flood Water Area (ha):', preWaterHa);
+  print('Post-Flood Water Area (ha):', postWaterHa);
+
+  // ====================
+  // ✅ Chart
+  // ====================
+  preWaterHa.getInfo(function(preVal) {
+    postWaterHa.getInfo(function(postVal) {
+      var chart = ui.Chart.array.values(
+        ee.Array([[preVal], [postVal]]), 0, ['Pre-Flood', 'Post-Flood']
+      ).setChartType('ColumnChart')
+       .setOptions({
+          title: 'Water Area Comparison (ha)',
+          hAxis: {title: 'Period'},
+          vAxis: {title: 'Area'},
+          legend: {position: 'none'},
+          colors: ['#1f78b4']
+       });
+
+      var chartPanel = ui.Panel({
+        widgets: [
+          ui.Label('Water Area Comparison'),
+          chart,
+          ui.Button({
+            label: 'Close',
+            onClick: function() {
+              Map.remove(chartPanel);
+            }
+          })
+        ],
+        style: {
+          width: '400px',
+          padding: '10px',
+          position: 'bottom-left'
+        }
+      });
+
+      Map.add(chartPanel);
+    });
+  });
+
+  // ====================
+  // ✅ Export Post-Flood Water Mask
+  // ====================
+  Export.image.toDrive({
+    image: postWaterMask.updateMask(postWaterMask),
+    description: 'PostFlood_WaterMask_Sentinel2',
+    folder: 'EarthEngineExports',
+    fileNamePrefix: 'PostFlood_WaterMask_Sentinel2',
+    region: table.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+}
